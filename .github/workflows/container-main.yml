@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - suluck/username-ip-allocation
     paths:
       - "*.nix"
       - "go.*"
