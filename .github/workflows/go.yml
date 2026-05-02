@@ -1,28 +1,40 @@
-# This workflow will build a golang project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
-
-name: Go
+name: Go Linux Build
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["suluck/username-ip-allocation"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["suluck/username-ip-allocation"]
+  workflow_dispatch:
 
 jobs:
-
-  build:
+  build-linux:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goarch: amd64
+            artifact_name: headscale-linux-amd64
+          - goarch: arm64
+            artifact_name: headscale-linux-arm64
+
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.20'
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.1"
 
-    - name: Build
-      run: go build -v ./...
+      - name: Build Linux binary
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -o headscale ./cmd/headscale
 
-    - name: Test
-      run: go test -v ./...
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: headscale
