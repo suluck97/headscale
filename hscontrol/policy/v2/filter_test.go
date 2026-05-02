@@ -3537,11 +3537,26 @@ func TestFilterAllowAllFix(t *testing.T) {
 			wantFilterAllow: true,
 		},
 		{
-			name: "nil ACLs and empty grants returns FilterAllowAll",
+			name: "nil ACLs and empty grants denies all",
 			pol: &Policy{
 				Grants: []Grant{},
 			},
-			wantFilterAllow: true,
+			wantFilterAllow: false,
+		},
+		{
+			name: "empty ACLs and nil grants denies all",
+			pol: &Policy{
+				ACLs: []ACL{},
+			},
+			wantFilterAllow: false,
+		},
+		{
+			name: "empty ACLs and empty grants denies all",
+			pol: &Policy{
+				ACLs:   []ACL{},
+				Grants: []Grant{},
+			},
+			wantFilterAllow: false,
 		},
 		{
 			name: "both ACLs and grants should not return FilterAllowAll",
@@ -3653,6 +3668,27 @@ func TestCompileViaGrant(t *testing.T) {
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
 
+	// Expected rule for autogroup:internet on a via-tagged exit
+	// advertiser: SrcIPs scoped to the grant source, DstPorts
+	// enumerating util.TheInternet() prefixes.
+	internetDstPorts := make(
+		[]tailcfg.NetPortRange, 0, len(util.TheInternet().Prefixes()),
+	)
+
+	for _, p := range util.TheInternet().Prefixes() {
+		internetDstPorts = append(internetDstPorts, tailcfg.NetPortRange{
+			IP:    p.String(),
+			Ports: tailcfg.PortRangeAny,
+		})
+	}
+
+	internetWant := []tailcfg.FilterRule{
+		{
+			SrcIPs:   []string{"100.64.0.10"},
+			DstPorts: internetDstPorts,
+		},
+	}
+
 	tests := []struct {
 		name    string
 		grant   Grant
@@ -3709,11 +3745,12 @@ func TestCompileViaGrant(t *testing.T) {
 			},
 		},
 		{
-			// autogroup:internet via grants do NOT produce PacketFilter rules
-			// on exit nodes. Tailscale SaaS handles exit traffic forwarding
-			// through the client's exit node mechanism, not PacketFilter.
-			// Verified by golden captures GRANT-V14 through GRANT-V36.
-			name: "autogroup:internet with exit routes produces no rules",
+			// autogroup:internet on a via-tagged exit advertiser
+			// produces a rule with DstPorts enumerating
+			// util.TheInternet(). The matchers derived from this
+			// rule let Node.CanAccess surface the exit node to
+			// grant sources via DestsIsTheInternet.
+			name: "autogroup:internet with exit routes produces TheInternet rule",
 			grant: Grant{
 				Sources:           Aliases{up("testuser@")},
 				Destinations:      Aliases{agp(string(AutoGroupInternet))},
@@ -3723,7 +3760,7 @@ func TestCompileViaGrant(t *testing.T) {
 			node:  exitNode,
 			nodes: types.Nodes{exitNode, srcNode},
 			pol:   &Policy{},
-			want:  nil,
+			want:  internetWant,
 		},
 		{
 			name: "autogroup:internet without exit routes returns nil",
@@ -4086,6 +4123,14 @@ func TestDestinationsToNetPortRange_AutogroupInternet(t *testing.T) {
 	pol := &Policy{}
 	ports := []tailcfg.PortRange{tailcfg.PortRangeAny}
 
+	// autogroup:internet must surface as DstPorts (not be skipped at
+	// compile time). The matcher derived from these FilterRules is
+	// what makes Node.CanAccess return true for exit-node peers via
+	// DestsIsTheInternet (#3212). The wire format is currently the
+	// canonical CIDR breakdown of util.TheInternet(); aligning it to
+	// the SaaS range form is tracked separately.
+	internetPrefixCount := len(util.TheInternet().Prefixes())
+
 	tests := []struct {
 		name     string
 		dests    Aliases
@@ -4093,9 +4138,9 @@ func TestDestinationsToNetPortRange_AutogroupInternet(t *testing.T) {
 		wantStar bool
 	}{
 		{
-			name:    "autogroup:internet produces no DstPorts",
+			name:    "autogroup:internet produces TheInternet DstPorts",
 			dests:   Aliases{agp(string(AutoGroupInternet))},
-			wantLen: 0,
+			wantLen: internetPrefixCount,
 		},
 		{
 			name:     "wildcard produces DstPorts with star",

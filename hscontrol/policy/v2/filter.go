@@ -138,7 +138,7 @@ func (pol *Policy) compileFilterRules(
 	users types.Users,
 	nodes views.Slice[types.NodeView],
 ) ([]tailcfg.FilterRule, error) {
-	if pol == nil || (pol.ACLs == nil && len(pol.Grants) == 0) {
+	if pol == nil || (pol.ACLs == nil && pol.Grants == nil) {
 		return tailcfg.FilterAllowAll, nil
 	}
 
@@ -163,12 +163,6 @@ func (pol *Policy) destinationsToNetPortRange(
 				})
 			}
 
-			continue
-		}
-
-		// autogroup:internet does not generate packet filters - it's handled
-		// by exit node routing via AllowedIPs, not by packet filtering.
-		if ag, isAutoGroup := dest.(*AutoGroup); isAutoGroup && ag.Is(AutoGroupInternet) {
 			continue
 		}
 

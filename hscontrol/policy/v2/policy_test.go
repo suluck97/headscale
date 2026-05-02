@@ -10,6 +10,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 )
 
@@ -43,6 +44,20 @@ func TestPolicyManager(t *testing.T) {
 			nodes:        types.Nodes{},
 			wantFilter:   tailcfg.FilterAllowAll,
 			wantMatchers: matcher.MatchesFromFilterRules(tailcfg.FilterAllowAll),
+		},
+		{
+			name:         "empty-acls-denies-all",
+			pol:          `{"acls": []}`,
+			nodes:        types.Nodes{},
+			wantFilter:   nil,
+			wantMatchers: matcher.MatchesFromFilterRules(nil),
+		},
+		{
+			name:         "empty-grants-denies-all",
+			pol:          `{"grants": []}`,
+			nodes:        types.Nodes{},
+			wantFilter:   nil,
+			wantMatchers: matcher.MatchesFromFilterRules(nil),
 		},
 	}
 
@@ -1625,10 +1640,14 @@ func TestViaRoutesForPeer(t *testing.T) {
 		require.NoError(t, err)
 
 		result := pm.ViaRoutesForPeer(nodes[0].View(), nodes[1].View())
-		// Include should have only the subnet route.
-		// autogroup:internet does not produce via route effects.
+		// Include contains the subnet route plus the peer's approved
+		// exit routes — the peer holds tag:router and advertises exit
+		// routes, so autogroup:internet steering applies alongside the
+		// explicit prefix.
 		require.Contains(t, result.Include, mp("10.0.0.0/24"))
-		require.Len(t, result.Include, 1)
+		require.Contains(t, result.Include, mp("0.0.0.0/0"))
+		require.Contains(t, result.Include, mp("::/0"))
+		require.Len(t, result.Include, 3)
 		require.Empty(t, result.Exclude)
 	})
 
@@ -1698,17 +1717,20 @@ func TestViaRoutesForPeer(t *testing.T) {
 		pm, err := NewPolicyManager([]byte(pol), users, nodes.ViewSlice())
 		require.NoError(t, err)
 
-		// autogroup:internet via grants do NOT affect AllowedIPs or
-		// route steering. Tailscale SaaS handles exit traffic through
-		// the client's exit node mechanism, not ViaRoutesForPeer.
-		// Verified by golden captures GRANT-V14 through GRANT-V36.
+		// autogroup:internet via grants surface the peer's approved
+		// exit routes when the peer carries the via tag, and exclude
+		// them when it does not — restricting which exit nodes the
+		// viewer may use, per Tailscale's grants-via spec for
+		// autogroup:internet.
 		resultExit := pm.ViaRoutesForPeer(nodes[0].View(), nodes[1].View())
-		require.Empty(t, resultExit.Include)
+		require.Contains(t, resultExit.Include, mp("0.0.0.0/0"))
+		require.Contains(t, resultExit.Include, mp("::/0"))
 		require.Empty(t, resultExit.Exclude)
 
 		resultOther := pm.ViaRoutesForPeer(nodes[0].View(), nodes[2].View())
 		require.Empty(t, resultOther.Include)
-		require.Empty(t, resultOther.Exclude)
+		require.Contains(t, resultOther.Exclude, mp("0.0.0.0/0"))
+		require.Contains(t, resultOther.Exclude, mp("::/0"))
 	})
 
 	t.Run("via_routes_survive_reduce_routes", func(t *testing.T) {
@@ -1791,4 +1813,51 @@ func TestViaRoutesForPeer(t *testing.T) {
 			"client should NOT be able to access 10.0.0.0/24 via matchers alone; "+
 				"state.RoutesForPeer adds via routes after ReduceRoutes to fix this")
 	})
+}
+
+// TestBuildPeerMap_AutogroupInternetMakesExitNodeVisible reproduces
+// juanfont/headscale#3212. An ACL that grants access only via
+// `autogroup:internet` must keep the exit node visible to the source
+// in BuildPeerMap so the Tailscale client surfaces it in
+// `tailscale exit-node list`. Authoritative SaaS captures
+// (tscap routes-b17/b18, 2026-04-28) confirm SaaS includes the exit
+// node in the source's Peers with 0.0.0.0/0 and ::/0 in AllowedIPs.
+func TestBuildPeerMap_AutogroupInternetMakesExitNodeVisible(t *testing.T) {
+	t.Parallel()
+
+	users := types.Users{
+		{Model: gorm.Model{ID: 1}, Name: "alice", Email: "alice@headscale.net"},
+	}
+
+	aliceNode := node("alice-laptop", "100.64.0.10", "fd7a:115c:a1e0::a", users[0])
+	aliceNode.ID = 1
+
+	exitRoutes := []netip.Prefix{tsaddr.AllIPv4(), tsaddr.AllIPv6()}
+	exitNode := node("alice-exit", "100.64.0.1", "fd7a:115c:a1e0::1", users[0])
+	exitNode.ID = 2
+	exitNode.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: exitRoutes}
+	exitNode.ApprovedRoutes = exitRoutes
+
+	nodes := types.Nodes{aliceNode, exitNode}
+
+	policy := `{
+		"acls": [
+			{"action": "accept", "src": ["alice@headscale.net"], "dst": ["autogroup:internet:*"]}
+		]
+	}`
+
+	pm, err := NewPolicyManager([]byte(policy), users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	peerMap := pm.BuildPeerMap(nodes.ViewSlice())
+
+	require.True(t,
+		slices.ContainsFunc(peerMap[aliceNode.ID], func(n types.NodeView) bool {
+			return n.ID() == exitNode.ID
+		}),
+		"alice should see the exit node as a peer when an ACL grants autogroup:internet (#3212)")
+
+	_, matchers := pm.Filter()
+	require.True(t, aliceNode.View().CanAccess(matchers, exitNode.View()),
+		"alice.CanAccess(exit) should be true via DestsIsTheInternet()+IsExitNode() (#3212)")
 }
