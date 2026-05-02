@@ -1,0 +1,31 @@
+[mcp_servers.claude-code-mcp]
+args = [
+    "-y",
+    "@steipete/claude-code-mcp@latest",
+]
+command = "npx"
+
+[mcp_servers.context7]
+args = [
+    "-y",
+    "@upstash/context7-mcp",
+]
+command = "npx"
+
+[mcp_servers.git]
+args = [
+    "-y",
+    "@cyanheads/git-mcp-server",
+]
+command = "npx"
+
+[mcp_servers.nixos]
+args = ["mcp-nixos"]
+command = "uvx"
+
+[mcp_servers.sequential-thinking]
+args = [
+    "-y",
+    "@modelcontextprotocol/server-sequential-thinking",
+]
+command = "npx"

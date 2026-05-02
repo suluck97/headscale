@@ -517,3 +517,129 @@ func TestIPAllocatorNextNoReservedIPs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, na("100.115.94.0"), *nextChrome)
 }
+
+func TestIPAllocatorNamespaceFillsLowestFreeIPFromExistingAllocations(t *testing.T) {
+	db := dbForTest(t)
+	user := types.User{Name: "alice"}
+	db.DB.Save(&user)
+
+	db.DB.Save(&types.Node{
+		User: &user,
+		IPv4: nap("100.64.0.2"),
+	})
+	db.DB.Save(&types.Node{
+		User: &user,
+		IPv4: nap("100.64.0.4"),
+	})
+
+	alloc, err := NewIPAllocator(
+		db,
+		mpp("100.65.0.0/24"),
+		nil,
+		types.IPAllocationStrategySequential,
+		map[string]netip.Prefix{
+			"alice": netip.MustParsePrefix("100.64.0.0/29"),
+		},
+	)
+	require.NoError(t, err)
+
+	got4, _, err := alloc.NextForNamespace("alice")
+	require.NoError(t, err)
+	require.NotNil(t, got4)
+	assert.Equal(t, na("100.64.0.1"), *got4)
+}
+
+func TestIPAllocatorNamespaceWrapsAroundToFreedIPs(t *testing.T) {
+	alloc, err := NewIPAllocator(
+		nil,
+		mpp("100.65.0.0/24"),
+		nil,
+		types.IPAllocationStrategySequential,
+		map[string]netip.Prefix{
+			"alice": netip.MustParsePrefix("100.64.0.0/29"),
+		},
+	)
+	require.NoError(t, err)
+
+	first, _, err := alloc.NextForNamespace("alice")
+	require.NoError(t, err)
+	second, _, err := alloc.NextForNamespace("alice")
+	require.NoError(t, err)
+	third, _, err := alloc.NextForNamespace("alice")
+	require.NoError(t, err)
+	fourth, _, err := alloc.NextForNamespace("alice")
+	require.NoError(t, err)
+	fifth, _, err := alloc.NextForNamespace("alice")
+	require.NoError(t, err)
+
+	require.Equal(t, na("100.64.0.1"), *first)
+	require.Equal(t, na("100.64.0.2"), *second)
+	require.Equal(t, na("100.64.0.3"), *third)
+	require.Equal(t, na("100.64.0.4"), *fourth)
+	require.Equal(t, na("100.64.0.5"), *fifth)
+
+	alloc.FreeIPs([]netip.Addr{*third})
+
+	reused, _, err := alloc.NextForNamespace("alice")
+	require.NoError(t, err)
+	require.NotNil(t, reused)
+	assert.Equal(t, na("100.64.0.3"), *reused)
+}
+
+func TestIPAllocatorNamespacePrefersGapBeforeAppending(t *testing.T) {
+	db := dbForTest(t)
+	user := types.User{Name: "alice"}
+	db.DB.Save(&user)
+
+	for _, ip := range []string{
+		"100.64.0.1",
+		"100.64.0.2",
+		"100.64.0.3",
+		"100.64.0.5",
+		"100.64.0.6",
+	} {
+		db.DB.Save(&types.Node{
+			User: &user,
+			IPv4: nap(ip),
+		})
+	}
+
+	alloc, err := NewIPAllocator(
+		db,
+		mpp("100.65.0.0/24"),
+		nil,
+		types.IPAllocationStrategySequential,
+		map[string]netip.Prefix{
+			"alice": netip.MustParsePrefix("100.64.0.0/24"),
+		},
+	)
+	require.NoError(t, err)
+
+	got4, _, err := alloc.NextForNamespace("alice")
+	require.NoError(t, err)
+	require.NotNil(t, got4)
+	assert.Equal(t, na("100.64.0.4"), *got4)
+}
+
+func TestIPAllocatorNamespaceMatchesCaseInsensitiveUsernames(t *testing.T) {
+	db := dbForTest(t)
+	user := types.User{Name: "taj"}
+	db.DB.Save(&user)
+
+	alloc, err := NewIPAllocator(
+		db,
+		mpp("100.64.5.0/24"),
+		nil,
+		types.IPAllocationStrategySequential,
+		map[string]netip.Prefix{
+			"TAJ": netip.MustParsePrefix("100.64.1.0/24"),
+			"QT":  netip.MustParsePrefix("100.64.5.0/24"),
+		},
+	)
+	require.NoError(t, err)
+
+	got4, _, err := alloc.NextForNamespace(user.Name)
+	require.NoError(t, err)
+	require.NotNil(t, got4)
+	assert.Equal(t, na("100.64.1.1"), *got4)
+}

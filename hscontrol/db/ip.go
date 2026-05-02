@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/netip"
+	"strings"
 	"sync"
 
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -22,6 +23,10 @@ var (
 	errGeneratedIPNotInPrefix  = errors.New("generated ip not in prefix")
 	errIPAllocatorNil          = errors.New("ip allocator was nil")
 )
+
+func normalizeNamespaceKey(namespace string) string {
+	return strings.ToLower(strings.TrimSpace(namespace))
+}
 
 // IPAllocator is a singleton responsible for allocating
 // IP addresses for nodes and making sure the same
@@ -75,9 +80,17 @@ func NewIPAllocator(
 		prefix4:    prefix4,
 		prefix6:    prefix6,
 		strategy:   strategy,
-		nsPrefixes: nsPrefixes,
 		nsPrev:     make(map[string]netip.Addr),
 		nsUsed:     make(map[string]*netipx.IPSetBuilder),
+	}
+
+	if len(nsPrefixes) > 0 {
+		ret.nsPrefixes = make(map[string]netip.Prefix, len(nsPrefixes))
+		for ns, pfx := range nsPrefixes {
+			ret.nsPrefixes[normalizeNamespaceKey(ns)] = pfx
+		}
+	} else {
+		ret.nsPrefixes = make(map[string]netip.Prefix)
 	}
 
 	var (
@@ -126,7 +139,7 @@ func NewIPAllocator(
 
 	// Initialise per-namespace prefix pools: reserve network/broadcast addresses
 	// and set the starting prev pointer for each namespace prefix.
-	for ns, pfx := range nsPrefixes {
+	for ns, pfx := range ret.nsPrefixes {
 		pfxCopy := pfx
 		nsb := &netipx.IPSetBuilder{}
 		network, broadcast := util.GetIPPrefixEndpoints(pfxCopy)
@@ -136,76 +149,67 @@ func NewIPAllocator(
 		ret.nsPrev[ns] = network
 	}
 
-	// Fetch all nodes from the database to properly initialize namespace prev pointers.
-	var nodes []types.Node
+	type nodeIPAllocationRow struct {
+		IPv4     sql.NullString
+		IPv6     sql.NullString
+		UserName sql.NullString
+	}
+
+	// Fetch only the columns needed to initialize allocator state. Loading full
+	// Node rows here pulls in unrelated serializers and can fail allocator startup
+	// for reasons unrelated to address allocation.
+	var rows []nodeIPAllocationRow
 	if db != nil {
 		err := db.Read(func(rx *gorm.DB) error {
-			return rx.Preload("User").Find(&nodes).Error
+			return rx.Model(&types.Node{}).
+				Select("nodes.ipv4", "nodes.ipv6", "users.name as user_name").
+				Joins("LEFT JOIN users ON users.id = nodes.user_id").
+				Scan(&rows).Error
 		})
 		if err != nil {
-			return nil, fmt.Errorf("reading nodes from database: %w", err)
+			return nil, fmt.Errorf("reading allocated IPs from database: %w", err)
 		}
 	}
 
-	// Track the highest IP allocated per namespace to set nsPrev correctly.
-	nsMaxIP := make(map[string]netip.Addr)
-
 	// Fetch all the IP Addresses currently handed out from the Database
 	// and add them to the used IP set.
-	for _, node := range nodes {
+	for _, row := range rows {
 		// Process IPv4
-		if node.IPv4 != nil {
-			addr := *node.IPv4
+		if row.IPv4.Valid {
+			addr, err := netip.ParseAddr(row.IPv4.String)
+			if err != nil {
+				return nil, fmt.Errorf("parsing IPv4 address from database: %w", err)
+			}
 
 			// Add to global used set.
 			ips.Add(addr)
 
 			// Determine namespace for this node
 			namespace := ""
-			if node.User != nil {
-				namespace = node.User.Name
+			if row.UserName.Valid {
+				namespace = normalizeNamespaceKey(row.UserName.String)
 			}
 
 			// Add to namespace pool and track max IP if this namespace has a dedicated prefix
 			if namespace != "" {
-				if nsPfx, ok := nsPrefixes[namespace]; ok {
+				if nsPfx, ok := ret.nsPrefixes[namespace]; ok {
 					if nsPfx.Contains(addr) {
 						nsb := ret.nsUsed[namespace]
 						nsb.Add(addr)
-
-						// Track the highest IP in this namespace
-						if maxIP, exists := nsMaxIP[namespace]; !exists || addr.Compare(maxIP) > 0 {
-							nsMaxIP[namespace] = addr
-						}
 					}
 				}
-			}
-
-			// Add to all namespace pools to prevent cross-namespace collisions
-			for ns, nsb := range ret.nsUsed {
-				nsb.Add(addr)
 			}
 		}
 
 		// Process IPv6
-		if node.IPv6 != nil {
-			addr := *node.IPv6
-			ips.Add(addr)
-
-			// IPv6 doesn't use namespace-specific prefixes, but still add to all namespace pools
-			for _, nsb := range ret.nsUsed {
-				nsb.Add(addr)
+		if row.IPv6.Valid {
+			addr, err := netip.ParseAddr(row.IPv6.String)
+			if err != nil {
+				return nil, fmt.Errorf("parsing IPv6 address from database: %w", err)
 			}
-		}
-	}
 
-	// Update nsPrev to the highest allocated IP in each namespace
-	for ns, maxIP := range nsMaxIP {
-		ret.nsPrev[ns] = maxIP
-		log.Debug().
-			Str("namespace", ns).
-			Str("max_ip", maxIP.String()).
-			Msg("initialized namespace prev pointer from existing allocations")
+			ips.Add(addr)
+		}
 	}
 
 	// Build the initial IPSet to validate that we can use it.
@@ -260,6 +264,8 @@ func (i *IPAllocator) Next() (*netip.Addr, *netip.Addr, error) {
 func (i *IPAllocator) NextForNamespace(namespace string) (*netip.Addr, *netip.Addr, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
+
+	namespace = normalizeNamespaceKey(namespace)
 
 	var (
 		err  error
@@ -354,7 +360,7 @@ func (i *IPAllocator) nextFromBuilder(prev netip.Addr, prefix *netip.Prefix, bui
 
 	switch i.strategy {
 	case types.IPAllocationStrategySequential:
-		ip = prev.Next()
+		ip = prefix.Addr().Next()
 	case types.IPAllocationStrategyRandom:
 		ip, err = randomNext(*prefix)
 		if err != nil {
@@ -367,27 +373,8 @@ func (i *IPAllocator) nextFromBuilder(prev netip.Addr, prefix *netip.Prefix, bui
 		return nil, err
 	}
 
-	startIP := ip
-	wrappedAround := false
-
 	for {
 		if !prefix.Contains(ip) {
-			// If we've reached the end of the prefix and haven't wrapped around yet,
-			// start from the beginning to find holes left by deleted nodes
-			if !wrappedAround && i.strategy == types.IPAllocationStrategySequential {
-				wrappedAround = true
-				ip = prefix.Addr().Next() // Start from first usable IP in prefix
-				log.Debug().
-					Str("prefix", prefix.String()).
-					Str("restart_ip", ip.String()).
-					Msg("reached end of prefix, wrapping around to find freed IPs")
-				continue
-			}
-			return nil, ErrCouldNotAllocateIP
-		}
-
-		// Prevent infinite loop: if we've wrapped around and reached the starting IP again
-		if wrappedAround && ip.Compare(startIP) >= 0 {
 			return nil, ErrCouldNotAllocateIP
 		}
 
@@ -540,7 +527,7 @@ func (db *HSDatabase) BackfillNodeIPs(i *IPAllocator) ([]string, error) {
 			// Determine the namespace name for this node (used for per-namespace prefix lookup).
 			namespace := ""
 			if node.User != nil {
-				namespace = node.User.Name
+				namespace = normalizeNamespaceKey(node.User.Name)
 			}
 
 			changed := false
@@ -610,13 +597,18 @@ func (i *IPAllocator) FreeIPs(ips []netip.Addr) {
 		// Remove from global used set
 		i.usedIPs.Remove(ip)
 
-		// Also remove from all namespace-specific used sets
-		for ns, nsb := range i.nsUsed {
-			nsb.Remove(ip)
-			log.Debug().
-				Str("namespace", ns).
-				Str("ip", ip.String()).
-				Msg("freed IP from namespace pool")
+		for ns, nsPfx := range i.nsPrefixes {
+			if !nsPfx.Contains(ip) {
+				continue
+			}
+
+			if nsb, ok := i.nsUsed[ns]; ok {
+				nsb.Remove(ip)
+				log.Debug().
+					Str("namespace", ns).
+					Str("ip", ip.String()).
+					Msg("freed IP from namespace pool")
+			}
 		}
 	}
 }

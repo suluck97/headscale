@@ -1126,7 +1126,7 @@ func LoadServerConfig() (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parsing prefixes.by_namespace[%q]: %w", ns, err)
 		}
-		prefixesByNamespace[ns] = p
+		prefixesByNamespace[strings.ToLower(strings.TrimSpace(ns))] = p
 	}
 
 	dnsConfig, err := dns()
